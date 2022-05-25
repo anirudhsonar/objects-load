@@ -13778,7 +13778,7 @@ class WorkloadRunner():
                         nargs="?", type=self._utils.convert_bool, default=False)
     parser.add_argument("--maxkeys_to_list", required=False, type=int,
                         nargs="+", help="Max keys to list in one call."
-                        "Default:[1, 1000]", default=[500, 1000])
+                        "Default:[1, 1000]", default=[1, 2])
     parser.add_argument("--validate_list_against_head", required=False,
                         help="validate_list_against_head.Default:false",
                         nargs="?", type=self._utils.convert_bool, default=False)
