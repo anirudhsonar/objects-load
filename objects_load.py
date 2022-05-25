@@ -523,8 +523,7 @@ class UploadObjs(object):
         versioning = self._execute(self._s3ops.s3_get_bucket_versioning,
                      Bucket=bucket).get("Status") in ["Suspended", "Enabled"]
         self._bucket_info["delete_bucket_to_marker_map"][bucket] = {
-                "versioning":versioning, "vmarkers":[("", "")], "markers":[""],
-                "locker":None}
+                "versioning":versioning, "locker":None}
     stime = time()
     self._deleted_objects =  0
     self._deleted_skipped = 0
@@ -552,6 +551,9 @@ class UploadObjs(object):
                   "in_use_buckets"]), len(self._bucket_info["bucket_names"])))
         sleep(1)
         continue
+      if prefix not in self._bucket_info["delete_bucket_to_marker_map"][bucket]:
+        self._bucket_info["delete_bucket_to_marker_map"][bucket][prefix] = {
+          "version_marker":"", "key_marker":"", "continuation_token":""}
       self._task_manager.add(self._list_and_delete, prefix=prefix,
           quota_type="delete", bucket=bucket)
 
@@ -2708,19 +2710,20 @@ class UploadObjs(object):
     bucket_info = self._bucket_info["delete_bucket_to_marker_map"][bucket]
     res = None
     if bucket_info["versioning"] and not self._kwargs["skip_version_deletes"]:
-      markers = bucket_info["vmarkers"][-1]
+      markers = bucket_info[prefix]
       res, vmarker, kmarker, istrunc = self._list_objects(bucket=bucket,
-           versions=True, vmarker=markers[0], kmarker=markers[1], prefix=prefix)
+           versions=True, vmarker=markers["version_marker"],
+           kmarker=markers["key_marker"], prefix=prefix)
       #If istrunc is false means we deleted all objects & safe to reset markers
       if not istrunc: vmarker, kmarker = "", ""
-      self._bucket_info["delete_bucket_to_marker_map"][bucket][
-                                          "vmarkers"] = [(vmarker,  kmarker)]
+      self._bucket_info["delete_bucket_to_marker_map"][bucket][prefix].update({
+        "version_marker":vmarker, "key_marker":kmarker})
     else:
       res, marker, istrunc = self._list_objects(bucket=bucket, prefix=prefix,
-                              versions=False, marker=bucket_info["markers"][-1])
+             versions=False, marker=bucket_info[prefix]["continuation_token"])
       if not istrunc: marker = ""
-      self._bucket_info["delete_bucket_to_marker_map"][bucket][
-                                                          "markers"] = [marker]
+      self._bucket_info["delete_bucket_to_marker_map"][bucket][prefix].update({
+        "continuation_token":marker})
     self._validate_and_delete_objects(bucket, res,
                                       self._kwargs["skip_head_before_delete"],
                                       self._kwargs["skip_head_after_delete"],
@@ -2750,9 +2753,8 @@ class UploadObjs(object):
     bucket_marker = self._bucket_info["bucket_to_marker_map"][bucket].get(
                     objprefix, {})
     version, vmarker, kmarker, istrunc =  self._list_objects(bucket=bucket,
-      vmarker=bucket_marker.get("version_marker", ""), maxkeys=maxkeys,
-      kmarker=bucket_marker.get("key_marker", ""), prefix=objprefix,
-      versions=True)
+      vmarker=bucket_marker.get("version_marker"), maxkeys=maxkeys,
+      kmarker=bucket_marker.get("key_marker"), prefix=objprefix, versions=True)
     if kmarker and not kmarker.startswith(objprefix):
       ERROR("Bucket : %s, Prefix : %s, Markers : %s, KMarker %s does not start "
             "with Prefix."%(bucket, objprefix, bucket_marker, kmarker))
@@ -2941,24 +2943,27 @@ class UploadObjs(object):
                     prefix=None, versions=False, maxkeys=1000):
     params = {"MaxKeys":maxkeys}
     params["Bucket"] = bucket
-    if kmarker or vmarker:
-      params["VersionIdMarker"] = vmarker
+    if kmarker:
       params["KeyMarker"] = kmarker
+    if vmarker:
+      params["VersionIdMarker"] = vmarker
     if prefix:
       params["Prefix"] = prefix
     if not versions:
       #params["Marker"] = marker
       params["ContinuationToken"] = marker
       res = self._execute(self._s3ops.s3_list_objects_v2, **params)
-      self._dump_res_to_file(res, bucket, filename="%s_%s_objects_v2.json"%(
-                    self._get_worker_filemarker().replace(".json",""), bucket))
+      self._dump_res_to_file({"api_params":params, "api_response":res}, bucket,
+        filename="%s_%s_objects_v2.json"%(self._get_worker_filemarker(
+          ).replace(".json",""), bucket))
       return res,res.get("NextContinuationToken",""),res.get("IsTruncated")
     else:
       self._debug_logging("Listing versions. Bucket : %s, VersionIdMarker : %s,"
         "Object Marker : %s, Prefix : %s"%(bucket, vmarker, kmarker, prefix), 3)
       res = self._execute(self._s3ops.s3_list_object_versions, **params)
-      self._dump_res_to_file(res, bucket, filename="%s_%s_versions.json"%(
-               self._get_worker_filemarker().replace(".json",""), bucket))
+      self._dump_res_to_file({"api_params":params, "api_response":res}, bucket,
+        filename="%s_%s_versions.json"%(self._get_worker_filemarker(
+        ).replace(".json",""), bucket))
     return res,res.get("NextVersionIdMarker",""),res.get("NextKeyMarker",""
                   ), res.get("IsTruncated")
 
@@ -3991,7 +3996,6 @@ class UploadObjs(object):
                                skip_version_deletes):
     objects = []
     dmarkers = size = skipped = 0
-    all_versions = {}
     all_versions = res.get("Versions", []) if "Versions" in res else res.get(
                                                                 "Contents", [])
     all_versions = self._lock_unblock_all_objs(bucket, all_versions, True)
@@ -4012,6 +4016,7 @@ class UploadObjs(object):
       current_key = {"Key" :i.get("Key")}
       if "VersionId" in i: current_key["VersionId"] = i["VersionId"]
       objects.append(current_key)
+      dmarkers += 1
     if objects:
       self._delete_objects_from_bucket(bucket, objects, size, dmarkers, skipped,
                  skip_head_after_delete, skip_read_before_delete, all_versions,
@@ -4105,7 +4110,7 @@ class Monitor():
 
   def check_active_compactions(self):
     if not self._testobj._oss_cluster:
-      return False
+      return
     cstats = self._testobj._oss_cluster.ms.get_compaction_stats()
     for ms, stats in cstats.iteritems():
       for active_compactions in stats["active_compactions"]:
@@ -4403,7 +4408,8 @@ class ObjNameDistributor():
                               debug=False, nfs_workload=False, workload=None,
                               dstbucket=None):
     workload = workload.lower() if workload else workload
-    self._testobj._total_ops_recorded["misc"].setdefault(workload,{"delay" : 0})
+    self._testobj._total_ops_recorded["misc"].setdefault(
+                                                workload, {"delay" : 0})
     delay = 0
     while not self._testobj._time_to_exit:
       bucket = self._get_bucket_for_copy(prefix, nfs_workload)
@@ -13422,6 +13428,9 @@ class WorkloadRunner():
                         "symlink. Default:test.log", default="test.log")
     parser.add_argument("--ignore_errors", required=False, help="Errors to "
                         "ignore seperated by comma. Default:None", default="")
+    parser.add_argument("--force_kill", required=False, help="Force kill test "
+                        "without waiting on stop_workload call.Default:False",
+                        nargs="?", type=self._utils.convert_bool, default=False)
     parser.add_argument("--force_ignore_errors", required=False, help="Force "
                         "ignore all the errors. Default:False",
                         nargs="?", type=self._utils.convert_bool, default=False)
@@ -13769,7 +13778,7 @@ class WorkloadRunner():
                         nargs="?", type=self._utils.convert_bool, default=False)
     parser.add_argument("--maxkeys_to_list", required=False, type=int,
                         nargs="+", help="Max keys to list in one call."
-                        "Default:[1, 1000]", default=[1, 2])
+                        "Default:[1, 1000]", default=[500, 1000])
     parser.add_argument("--validate_list_against_head", required=False,
                         help="validate_list_against_head.Default:false",
                         nargs="?", type=self._utils.convert_bool, default=False)
