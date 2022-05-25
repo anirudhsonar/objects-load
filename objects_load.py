@@ -2747,16 +2747,22 @@ class UploadObjs(object):
     maxkeys = randint(self._kwargs["maxkeys_to_list"][0],
                       self._kwargs["maxkeys_to_list"][-1])
 
-    bucket_marker = self._bucket_info["bucket_to_marker_map"].get(bucket)[-1]
-    version, vmarker, kmarker, istrunc =  self._list_objects(bucket,
-              bucket_marker[0], bucket_marker[1], prefix=objprefix,
-              versions=True, maxkeys=maxkeys)
-    self._bucket_info["bucket_to_marker_map"][bucket] = [(vmarker, kmarker)]
+    bucket_marker = self._bucket_info["bucket_to_marker_map"][bucket].get(
+                    objprefix, {})
+    version, vmarker, kmarker, istrunc =  self._list_objects(bucket=bucket,
+      vmarker=bucket_marker.get("version_marker", ""), maxkeys=maxkeys,
+      kmarker=bucket_marker.get("key_marker", ""), prefix=objprefix,
+      versions=True)
+    if kmarker and not kmarker.startswith(objprefix):
+      ERROR("Bucket : %s, Prefix : %s, Markers : %s, KMarker %s does not start "
+            "with Prefix."%(bucket, objprefix, bucket_marker, kmarker))
+    self._bucket_info["bucket_to_marker_map"][bucket][objprefix] = {
+                                "version_marker":vmarker, "key_marker":kmarker}
     all_versions = version.get("Versions", [])
     prefixes = version.get("CommonPrefixes", [])
     dmarkers = version.get("DeleteMarkers", [])
     if not istrunc:
-      self._bucket_info["bucket_to_marker_map"][bucket] =[("","")]
+      self._bucket_info["bucket_to_marker_map"][bucket][objprefix] = {}
     else:
       if all_versions and (len(all_versions) + len(prefixes) + \
                            len(dmarkers)) != maxkeys:
@@ -3932,7 +3938,7 @@ class UploadObjs(object):
     if not self._bucket_info["bucket_to_marker_map"]:
       for bucket in self._bucket_info["bucket_names"]:
         if bucket not in self._bucket_info["bucket_to_marker_map"]:
-          self._bucket_info["bucket_to_marker_map"][bucket] = [("", "")]
+          self._bucket_info["bucket_to_marker_map"][bucket] = {}
 
   def _update_ei_results(self, comp, op, ftime, recovery_time):
     rtime = "%s (%s s)"%(recovery_time, (recovery_time-ftime).total_seconds())
